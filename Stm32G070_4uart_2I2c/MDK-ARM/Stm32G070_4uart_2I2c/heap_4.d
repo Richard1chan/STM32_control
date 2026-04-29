@@ -1,0 +1,13 @@
+stm32g070_4uart_2i2c\heap_4.o: ../Middlewares/Third_Party/FreeRTOS/Source/portable/MemMang/heap_4.c
+stm32g070_4uart_2i2c\heap_4.o: D:\Keil_v5\ARM\ARMCC\Bin\..\include\stdlib.h
+stm32g070_4uart_2i2c\heap_4.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/FreeRTOS.h
+stm32g070_4uart_2i2c\heap_4.o: D:\Keil_v5\ARM\ARMCC\Bin\..\include\stddef.h
+stm32g070_4uart_2i2c\heap_4.o: D:\Keil_v5\ARM\ARMCC\Bin\..\include\stdint.h
+stm32g070_4uart_2i2c\heap_4.o: ../Core/Inc/FreeRTOSConfig.h
+stm32g070_4uart_2i2c\heap_4.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/projdefs.h
+stm32g070_4uart_2i2c\heap_4.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/portable.h
+stm32g070_4uart_2i2c\heap_4.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/deprecated_definitions.h
+stm32g070_4uart_2i2c\heap_4.o: ../Middlewares/Third_Party/FreeRTOS/Source/portable/RVDS/ARM_CM0/portmacro.h
+stm32g070_4uart_2i2c\heap_4.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/mpu_wrappers.h
+stm32g070_4uart_2i2c\heap_4.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/task.h
+stm32g070_4uart_2i2c\heap_4.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/list.h
