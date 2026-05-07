@@ -29,6 +29,8 @@
 #include "usart.h"
 #include "gpio.h"
 #include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -47,9 +49,9 @@
 #define SLAVE_A_ID 0x19
 #define SLAVE_B_ID 0x1A
 
-#define SLAVE_ID  SLAVE_B_ID
+#define SLAVE_ID  SLAVE_A_ID
 
-/* Solenoid (电磁�?) */
+/* Solenoid (电磁�?) */
 #define SOLENOID0_PORT      GPIOA
 #define SOLENOID0_PIN       GPIO_PIN_3
 
@@ -69,7 +71,7 @@
 #define WATER_PUMP2_PORT    GPIOB
 #define WATER_PUMP2_PIN     GPIO_PIN_0
 
-/* Micro Pump (蠕动�?) */
+/* Micro Pump (蠕动�?) */
 #define MICRO_PUMP0_PORT    GPIOB
 #define MICRO_PUMP0_PIN     GPIO_PIN_1
 
@@ -107,10 +109,21 @@
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
 
-uint8_t rx_buf4;
+static volatile uint8_t rx_buf4;
 
-osMessageQueueId_t modbusRxQueue;  // Modbus消息队列
-osThreadId_t modbusTaskHandle;     
+static osMessageQueueId_t modbusRxQueue;
+static osSemaphoreId_t    modbusIdleSem;
+
+static uint32_t stat_frames     = 0;
+static uint32_t stat_crc_err    = 0;
+static uint32_t stat_tx_err     = 0;
+static uint32_t stat_uart4_errs = 0;
+
+/* 由 HAL_UART_ErrorCallback（ISR）置位，任务上下文重启 DMA */
+static volatile uint8_t  uart4_need_restart    = 0;
+/* ISR 保存 HAL 错误码，任务打印时解码（PE/NE/FE/ORE/DMA）*/
+static volatile uint32_t uart4_last_error_code = 0;
+
 /* USER CODE END Variables */
 /* Definitions for defaultTask */
 osThreadId_t defaultTaskHandle;
@@ -122,11 +135,14 @@ const osThreadAttr_t defaultTask_attributes = {
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
-/* USER CODE BEGIN FunctionPrototypes */
-uint16_t Modbus_CRC16(uint8_t *puchMsg, uint16_t usDataLen);
-uint16_t ReadModbusStatus(void);
-void WriteModbusStatus(uint16_t val);
-void ProcessModbusFrame(uint8_t *frame, uint16_t len);
+static void     debug_printf(const char *fmt, ...);
+static void     debug_dump_hex(const char *tag, const uint8_t *buf, uint16_t len);
+void            Modbus_IdleCallback(void);          /* called from ISR */
+static uint16_t Modbus_CRC16(uint8_t *puchMsg, uint16_t usDataLen);
+static uint16_t ReadModbusStatus(void);
+static void     WriteModbusStatus(uint16_t val);
+static void     SendModbusException(uint8_t fc, uint8_t exc);
+static void     ProcessModbusFrame(uint8_t *frame, uint16_t len);
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
@@ -183,33 +199,65 @@ void MX_FREERTOS_Init(void) {
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN StartDefaultTask */
-  
-  uint8_t rx_frame[128];
+
+  /* 创建 Modbus 接收队列：32字节，足够容纳115200波特率下帧间切换的积压 */
+  modbusRxQueue = osMessageQueueNew(32, sizeof(uint8_t), NULL);
+  /* 创建帧结束信号量（二值，初始为0），由 UART4 IDLE 中断释放 */
+  modbusIdleSem = osSemaphoreNew(1, 0, NULL);
+
+  /* 启动 DMA 接收，再开启 IDLE 中断 */
+  HAL_UART_Receive_DMA(&huart4, (uint8_t *)&rx_buf4, 1);
+  __HAL_UART_ENABLE_IT(&huart4, UART_IT_IDLE);
+
+  debug_printf("\r\n[BOOT] Modbus slave 0x%02X ready (UART4 115200 8N1)\r\n", SLAVE_ID);
+
+  uint8_t  rx_frame[128];
   uint16_t rx_len = 0;
-  //创建消息队列
-  modbusRxQueue = osMessageQueueNew(128, sizeof(uint8_t), NULL); // Modbus 队列
-  //�?启DMA接收
-  HAL_UART_Receive_DMA(&huart4, &rx_buf4, 1);
 
   /* Infinite loop */
   for(;;)
   {
-		    uint8_t byte;
-    // 等待接收超时设定�? 5ms (波特�?115200?,判定帧间�?)
-    osStatus_t status = osMessageQueueGet(modbusRxQueue, &byte, NULL, 5);
+    /*
+     * 等待 IDLE 信号（硬件帧尾检测，<1ms）或 3ms 超时兜底。
+     * 3ms >> 3.5字符时间@115200(~305us)，保证帧间隔判断可靠。
+     */
+    osSemaphoreAcquire(modbusIdleSem, 3);
 
-    if (status == osOK) {
+    /* 总线设备重启等导致的 UART 帧错误/过载错误恢复 */
+    if (uart4_need_restart) {
+      uart4_need_restart = 0;
+      uint32_t ec = uart4_last_error_code;
+      rx_len = 0;
+      osMessageQueueReset(modbusRxQueue);
+      HAL_UART_Receive_DMA(&huart4, (uint8_t *)&rx_buf4, 1);
+      __HAL_UART_ENABLE_IT(&huart4, UART_IT_IDLE);
+      debug_printf("[UART4] ERR recovered #%lu: code=0x%02lX%s%s%s%s%s\r\n",
+                   stat_uart4_errs, ec,
+                   (ec & HAL_UART_ERROR_PE)  ? " PE"  : "",
+                   (ec & HAL_UART_ERROR_NE)  ? " NE"  : "",
+                   (ec & HAL_UART_ERROR_FE)  ? " FE"  : "",
+                   (ec & HAL_UART_ERROR_ORE) ? " ORE" : "",
+                   (ec & HAL_UART_ERROR_DMA) ? " DMA" : "");
+      continue;
+    }
+
+    /* 排空队列，把所有已到达字节收入帧缓冲 */
+    uint8_t byte;
+    while (osMessageQueueGet(modbusRxQueue, &byte, NULL, 0) == osOK) {
       if (rx_len < sizeof(rx_frame)) {
         rx_frame[rx_len++] = byte;
       }
-    } else {
-      // 超时，一帧数据接收完�?
-      if (rx_len >= 8) { // Modbus标准帧最小长�?8字节
-			
-        ProcessModbusFrame(rx_frame, rx_len);
-      }
-      rx_len = 0; // 清缓�?
     }
+
+    if (rx_len == 0) continue;
+
+    if (rx_len >= 8) {
+      ProcessModbusFrame(rx_frame, rx_len);
+    } else {
+      debug_printf("[MODBUS] Short frame %u bytes, discarded\r\n", rx_len);
+      debug_dump_hex("[SHORT]", rx_frame, rx_len);
+    }
+    rx_len = 0;
   }
   /* USER CODE END StartDefaultTask */
 }
@@ -217,181 +265,223 @@ void StartDefaultTask(void *argument)
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
 
-// ------------------- DMA -------------------
+/* ------------------- Debug (UART1) ------------------- */
+static void debug_printf(const char *fmt, ...)
+{
+  static char buf[128];
+  va_list args;
+  va_start(args, fmt);
+  int len = vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  if (len > 0) {
+    HAL_UART_Transmit(&huart1, (uint8_t *)buf, (uint16_t)len, 100);
+  }
+}
+
+/* ------------------- 十六进制帧转储（仅任务上下文）------------------- */
+static void debug_dump_hex(const char *tag, const uint8_t *buf, uint16_t len)
+{
+  char line[96];
+  int pos = snprintf(line, sizeof(line), "%s[%u]:", tag, len);
+  uint16_t show = (len > 16) ? 16 : len;
+  for (uint16_t i = 0; i < show; i++) {
+    pos += snprintf(line + pos, sizeof(line) - pos, " %02X", buf[i]);
+  }
+  if (len > 16) {
+    pos += snprintf(line + pos, sizeof(line) - pos, " ..");
+  }
+  pos += snprintf(line + pos, sizeof(line) - pos, "\r\n");
+  HAL_UART_Transmit(&huart1, (uint8_t *)line, (uint16_t)pos, 200);
+}
+
+/* ------------------- IDLE 中断回调（从 stm32g0xx_it.c 调用）------------------- */
+/* 在 ISR 中释放信号量，通知任务一帧已结束 */
+void Modbus_IdleCallback(void)
+{
+  if (modbusIdleSem != NULL) {
+    osSemaphoreRelease(modbusIdleSem);
+  }
+}
+
+/* ------------------- DMA 字节接收回调 ------------------- */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART4) {
-    // USART4 收到数据，塞入Modbus队列
     if (modbusRxQueue != NULL) {
-      osMessageQueuePut(modbusRxQueue, &rx_buf4, 0, 0);
-    }
-  } 
-
-}
-
-uint16_t ReadModbusStatus(void) {
-  uint16_t status = 0;
-  //输出部分
-  if (HAL_GPIO_ReadPin(WATER_PUMP1_PORT, WATER_PUMP1_PIN) == GPIO_PIN_SET) status |= (1 << 0);
-  if (HAL_GPIO_ReadPin(WATER_PUMP2_PORT, WATER_PUMP2_PIN) == GPIO_PIN_SET) status |= (1 << 1);
-  if (HAL_GPIO_ReadPin(MICRO_PUMP0_PORT, MICRO_PUMP0_PIN) == GPIO_PIN_SET) status |= (1 << 2);
-  if (HAL_GPIO_ReadPin(MICRO_PUMP1_PORT, MICRO_PUMP1_PIN) == GPIO_PIN_SET) status |= (1 << 3);
-  if (HAL_GPIO_ReadPin(MICRO_PUMP2_PORT, MICRO_PUMP2_PIN) == GPIO_PIN_SET) status |= (1 << 4);
-  if (HAL_GPIO_ReadPin(MICRO_PUMP3_PORT, MICRO_PUMP3_PIN) == GPIO_PIN_SET) status |= (1 << 5);
-
-  if (HAL_GPIO_ReadPin(SOLENOID0_PORT, SOLENOID0_PIN) == GPIO_PIN_SET) status |= (1 << 6);
-  if (HAL_GPIO_ReadPin(SOLENOID1_PORT, SOLENOID1_PIN) == GPIO_PIN_SET) status |= (1 << 7);
-  if (HAL_GPIO_ReadPin(SOLENOID2_PORT, SOLENOID2_PIN) == GPIO_PIN_SET) status |= (1 << 8);
-  if (HAL_GPIO_ReadPin(SOLENOID3_PORT, SOLENOID3_PIN)== GPIO_PIN_SET) status |= (1 << 9);
-  if (HAL_GPIO_ReadPin(FAN0_FAN1_PORT, FAN0_FAN1_PIN)== GPIO_PIN_SET) status |= (1 << 10); 
-
- //输入部分
-  if (HAL_GPIO_ReadPin(DOOR_PORT, DOOR_PIN) == GPIO_PIN_SET) status |= (1 << 11); //
-  if (HAL_GPIO_ReadPin(PALLET0_PORT, PALLET0_PIN)== GPIO_PIN_SET) status |= (1 << 12); // 
-  if (HAL_GPIO_ReadPin(PALLET1_PORT, PALLET1_PIN)== GPIO_PIN_SET) status |= (1 << 13); // 
-  if (HAL_GPIO_ReadPin(PALLET2_PORT, PALLET2_PIN)== GPIO_PIN_SET) status |= (1 << 14); // 
-  if (HAL_GPIO_ReadPin(PALLET3_PORT, PALLET3_PIN)== GPIO_PIN_SET) status |= (1 << 15); // 
-
-  return status;
-}
-
-void WriteModbusStatus(uint16_t val) {
-  HAL_GPIO_WritePin(WATER_PUMP1_PORT, WATER_PUMP1_PIN, (val & (1<<0)) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(WATER_PUMP2_PORT, WATER_PUMP2_PIN, (val & (1<<1)) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(MICRO_PUMP0_PORT, MICRO_PUMP0_PIN, (val & (1<<2)) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(MICRO_PUMP1_PORT, MICRO_PUMP1_PIN, (val & (1<<3)) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(MICRO_PUMP2_PORT, MICRO_PUMP2_PIN, (val & (1<<4)) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(MICRO_PUMP3_PORT, MICRO_PUMP3_PIN, (val & (1<<5)) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-
-  HAL_GPIO_WritePin(SOLENOID0_PORT, SOLENOID0_PIN, (val & (1<<6)) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(SOLENOID1_PORT, SOLENOID1_PIN, (val & (1<<7)) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(SOLENOID2_PORT, SOLENOID2_PIN, (val & (1<<8)) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(SOLENOID3_PORT, SOLENOID3_PIN, (val & (1<<9)) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(FAN0_FAN1_PORT, FAN0_FAN1_PIN, (val & (1<<10))? GPIO_PIN_SET : GPIO_PIN_RESET);
-}
-
-// ------------------- Modbus 帧解�?-------------------
-void ProcessModbusFrame(uint8_t *frame, uint16_t len) {
-  // 1. �?查从机地�?
-  if (frame[0] != SLAVE_ID) return; 
-
-  // 2. �?查CRC校验
-  uint16_t calc_crc = Modbus_CRC16(frame, len - 2);
-  uint16_t recv_crc = frame[len-2] | (frame[len-1] << 8);
-  if (calc_crc != recv_crc) return;
-  // 3. 解析功能�?
-// 3. ?????
-  if (frame[1] == 0x06) // ????1?:0x06 ??????
-  {
-    if (len < 8) return; // ????2?:0x06 ???????? 8 ??
-
-    uint16_t reg_addr = (frame[2] << 8) | frame[3];
-    // ????3?:0x06 ???????????,? frame[4] ? frame[5]
-    uint16_t data = (frame[4] << 8) | frame[5]; 
-
-    // ??????? 0x0000
-    if (reg_addr == 0x0000) {
-      WriteModbusStatus(data); // ??????
-
-      // ????4?:??????0x06 ???????????6???????
-      uint8_t resp[8];
-      resp[0] = SLAVE_ID;         // ????
-      resp[1] = 0x06;         // ???
-      resp[2] = frame[2];     // ???????
-      resp[3] = frame[3];     // ???????
-      resp[4] = frame[4];     // ???????
-      resp[5] = frame[5];     // ???????
-      
-      uint16_t resp_crc = Modbus_CRC16(resp, 6);
-      resp[6] = resp_crc & 0xFF;
-      resp[7] = (resp_crc >> 8) & 0xFF;
-      
-      // ??:??? HAL_UART_Transmit ??? ModbusTask ???,
-      // ????????????,??????!
-      HAL_UART_Transmit(&huart4, resp, 8, 100);
-    }
-  }
-  else if (frame[1] == 0x04) // 0x04 读输入寄存器
-  {
-    uint16_t reg_addr = (frame[2] << 8) | frame[3];
-    uint16_t reg_qty = (frame[4] << 8) | frame[5];
-
-    // 判断地址是否�?0x0000，且仅读�?个寄存器
-    if (reg_addr == 0x0000 && reg_qty == 1) {
-      uint16_t data = ReadModbusStatus(); // 获取硬件状�??
-
-      // 构建应答�?
-      uint8_t resp[7];
-      resp[0] = SLAVE_ID;
-      resp[1] = 0x04;
-      resp[2] = 0x02; // 字节�?
-      resp[3] = (data >> 8) & 0xFF; // 数据高位
-      resp[4] = data & 0xFF;        // 数据地位
-      uint16_t resp_crc = Modbus_CRC16(resp, 5);
-      resp[5] = resp_crc & 0xFF;
-      resp[6] = (resp_crc >> 8) & 0xFF;
-      HAL_UART_Transmit(&huart4, resp, 7, 100);
+      osMessageQueuePut(modbusRxQueue, (const void *)&rx_buf4, 0, 0);
     }
   }
 }
 
-// ------------------- CRC16 算法 -------------------
-uint16_t Modbus_CRC16(uint8_t *puchMsg, uint16_t usDataLen) {
+/* ------------------- UART 错误回调（ISR 上下文）------------------- */
+/* 总线上其他设备重启/掉电会产生帧错误(FE)或过载(ORE)，HAL 因此中止 DMA。
+ * 这里只置标志并唤醒任务，实际重启在任务上下文中执行，避免在 ISR 里调用 HAL。 */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART4) {
+    stat_uart4_errs++;
+    uart4_last_error_code = huart->ErrorCode;
+    uart4_need_restart = 1;
+    if (modbusIdleSem != NULL) {
+      osSemaphoreRelease(modbusIdleSem);
+    }
+  }
+}
+
+/* ------------------- GPIO 读写 ------------------- */
+static uint16_t ReadModbusStatus(void)
+{
+  uint16_t s = 0;
+  if (HAL_GPIO_ReadPin(WATER_PUMP1_PORT, WATER_PUMP1_PIN) == GPIO_PIN_SET) s |= (1 << 0);
+  if (HAL_GPIO_ReadPin(WATER_PUMP2_PORT, WATER_PUMP2_PIN) == GPIO_PIN_SET) s |= (1 << 1);
+  if (HAL_GPIO_ReadPin(MICRO_PUMP0_PORT, MICRO_PUMP0_PIN) == GPIO_PIN_SET) s |= (1 << 2);
+  if (HAL_GPIO_ReadPin(MICRO_PUMP1_PORT, MICRO_PUMP1_PIN) == GPIO_PIN_SET) s |= (1 << 3);
+  if (HAL_GPIO_ReadPin(MICRO_PUMP2_PORT, MICRO_PUMP2_PIN) == GPIO_PIN_SET) s |= (1 << 4);
+  if (HAL_GPIO_ReadPin(MICRO_PUMP3_PORT, MICRO_PUMP3_PIN) == GPIO_PIN_SET) s |= (1 << 5);
+  if (HAL_GPIO_ReadPin(SOLENOID0_PORT,   SOLENOID0_PIN)   == GPIO_PIN_SET) s |= (1 << 6);
+  if (HAL_GPIO_ReadPin(SOLENOID1_PORT,   SOLENOID1_PIN)   == GPIO_PIN_SET) s |= (1 << 7);
+  if (HAL_GPIO_ReadPin(SOLENOID2_PORT,   SOLENOID2_PIN)   == GPIO_PIN_SET) s |= (1 << 8);
+  if (HAL_GPIO_ReadPin(SOLENOID3_PORT,   SOLENOID3_PIN)   == GPIO_PIN_SET) s |= (1 << 9);
+  if (HAL_GPIO_ReadPin(FAN0_FAN1_PORT,   FAN0_FAN1_PIN)   == GPIO_PIN_SET) s |= (1 << 10);
+  /* 输入 */
+  if (HAL_GPIO_ReadPin(DOOR_PORT,    DOOR_PIN)    == GPIO_PIN_SET) s |= (1 << 11);
+  if (HAL_GPIO_ReadPin(PALLET0_PORT, PALLET0_PIN) == GPIO_PIN_SET) s |= (1 << 12);
+  if (HAL_GPIO_ReadPin(PALLET1_PORT, PALLET1_PIN) == GPIO_PIN_SET) s |= (1 << 13);
+  if (HAL_GPIO_ReadPin(PALLET2_PORT, PALLET2_PIN) == GPIO_PIN_SET) s |= (1 << 14);
+  if (HAL_GPIO_ReadPin(PALLET3_PORT, PALLET3_PIN) == GPIO_PIN_SET) s |= (1 << 15);
+  return s;
+}
+
+static void WriteModbusStatus(uint16_t val)
+{
+  HAL_GPIO_WritePin(WATER_PUMP1_PORT, WATER_PUMP1_PIN, (val & (1<<0))  ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(WATER_PUMP2_PORT, WATER_PUMP2_PIN, (val & (1<<1))  ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(MICRO_PUMP0_PORT, MICRO_PUMP0_PIN, (val & (1<<2))  ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(MICRO_PUMP1_PORT, MICRO_PUMP1_PIN, (val & (1<<3))  ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(MICRO_PUMP2_PORT, MICRO_PUMP2_PIN, (val & (1<<4))  ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(MICRO_PUMP3_PORT, MICRO_PUMP3_PIN, (val & (1<<5))  ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(SOLENOID0_PORT,   SOLENOID0_PIN,   (val & (1<<6))  ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(SOLENOID1_PORT,   SOLENOID1_PIN,   (val & (1<<7))  ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(SOLENOID2_PORT,   SOLENOID2_PIN,   (val & (1<<8))  ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(SOLENOID3_PORT,   SOLENOID3_PIN,   (val & (1<<9))  ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(FAN0_FAN1_PORT,   FAN0_FAN1_PIN,   (val & (1<<10)) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+/* ------------------- CRC16 ------------------- */
+static uint16_t Modbus_CRC16(uint8_t *puchMsg, uint16_t usDataLen)
+{
   uint16_t wCRCin = 0xFFFF;
-  uint16_t wCPoly = 0xA001;
   while (usDataLen--) {
     wCRCin ^= *puchMsg++;
     for (int i = 0; i < 8; i++) {
-      if (wCRCin & 0x01) {
-        wCRCin >>= 1;
-        wCRCin ^= wCPoly;
-      } else {
-        wCRCin >>= 1;
-      }
+      if (wCRCin & 0x01) { wCRCin = (wCRCin >> 1) ^ 0xA001; }
+      else               { wCRCin >>= 1; }
     }
   }
   return wCRCin;
 }
 
-// // ------------------- GPIO 去抖动与中断逻辑判断 -------------------
-// static uint32_t last_exti_time[16] = {0}; 
-// #define DEBOUNCE_DELAY 50 
+/* ------------------- Modbus 异常应答 ------------------- */
+static void SendModbusException(uint8_t fc, uint8_t exc)
+{
+  uint8_t resp[5];
+  resp[0] = SLAVE_ID;
+  resp[1] = fc | 0x80;
+  resp[2] = exc;
+  uint16_t crc = Modbus_CRC16(resp, 3);
+  resp[3] = crc & 0xFF;
+  resp[4] = (crc >> 8) & 0xFF;
+  HAL_UART_Transmit(&huart4, resp, 5, 50);
+  debug_printf("[MODBUS] Exception FC=0x%02X exc=0x%02X\r\n", fc, exc);
+}
 
-// uint8_t Is_Valid_Edge(uint16_t GPIO_Pin) {
-//   uint32_t current_time = HAL_GetTick(); 
-//   uint8_t pin_idx = 0;
-//   for (int i = 0; i < 16; i++) {
-//     if (GPIO_Pin == (1 << i)) {
-//       pin_idx = i;
-//       break;
-//     }
-//   }
-//   if ((current_time - last_exti_time[pin_idx]) < DEBOUNCE_DELAY) { return 0; }
-//   last_exti_time[pin_idx] = current_time;
-//   return 1; 
-// }
+/* ------------------- Modbus 帧解析与响应 ------------------- */
+static void ProcessModbusFrame(uint8_t *frame, uint16_t len)
+{
+  stat_frames++;
 
-// void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin) {
-//   if (GPIO_Pin == GPIO_PIN_12 || GPIO_Pin == GPIO_PIN_13 || 
-//       GPIO_Pin == GPIO_PIN_14 || GPIO_Pin == GPIO_PIN_15 || GPIO_Pin == GPIO_PIN_6) 
-//   {
-//     if (Is_Valid_Edge(GPIO_Pin)) {
-//       const char* msg = "open\r\n";
-//       if (uartMsgQueue != NULL) { osMessageQueuePut(uartMsgQueue, &msg, 0, 0); }
-//     }
-//   }
-// }
+  /* 1. 从机地址过滤（广播地址 0x00 不回应）*/
+  if (frame[0] != SLAVE_ID) return;
 
-// void HAL_GPIO_EXTI_Falling_Callback(uint16_t GPIO_Pin) {
-//   if (GPIO_Pin == GPIO_PIN_12 || GPIO_Pin == GPIO_PIN_13 || 
-//       GPIO_Pin == GPIO_PIN_14 || GPIO_Pin == GPIO_PIN_15 || GPIO_Pin == GPIO_PIN_6) 
-//   {
-//     if (Is_Valid_Edge(GPIO_Pin)) {
-//       const char* msg = "close\r\n";
-//       if (uartMsgQueue != NULL) { osMessageQueuePut(uartMsgQueue, &msg, 0, 0); }
-//     }
-//   }
-// }
+  /* 地址匹配：先打印原始帧，便于对比 CRC 和功能码 */
+  debug_dump_hex("[RX]", frame, len);
+
+  /* 2. CRC 校验 */
+  uint16_t calc_crc = Modbus_CRC16(frame, len - 2);
+  uint16_t recv_crc = (uint16_t)(frame[len-2]) | ((uint16_t)(frame[len-1]) << 8);
+  if (calc_crc != recv_crc) {
+    stat_crc_err++;
+    debug_printf("[MODBUS] CRC ERR frame#%lu: got=0x%04X calc=0x%04X len=%u\r\n",
+                 stat_frames, recv_crc, calc_crc, len);
+    return;
+  }
+
+  uint8_t fc = frame[1];
+
+  /* 3. FC 0x06: Write Single Register */
+  if (fc == 0x06) {
+    uint16_t reg_addr = ((uint16_t)frame[2] << 8) | frame[3];
+    uint16_t data     = ((uint16_t)frame[4] << 8) | frame[5];
+
+    if (reg_addr != 0x0000) {
+      debug_printf("[MODBUS] FC06 illegal addr=0x%04X\r\n", reg_addr);
+      SendModbusException(fc, 0x02); /* Illegal Data Address */
+      return;
+    }
+
+    WriteModbusStatus(data);
+
+    /* 回显请求帧（Modbus FC06 标准应答） */
+    uint8_t resp[8];
+    memcpy(resp, frame, 6);
+    uint16_t resp_crc = Modbus_CRC16(resp, 6);
+    resp[6] = resp_crc & 0xFF;
+    resp[7] = (resp_crc >> 8) & 0xFF;
+    if (HAL_UART_Transmit(&huart4, resp, 8, 50) != HAL_OK) {
+      stat_tx_err++;
+      debug_printf("[MODBUS] TX ERR (FC06) total_tx_err=%lu\r\n", stat_tx_err);
+    } else {
+      debug_printf("[MODBUS] FC06 write 0x%04X ok (frame#%lu)\r\n", data, stat_frames);
+      debug_dump_hex("[TX]", resp, 8);
+    }
+  }
+  /* 4. FC 0x04: Read Input Registers */
+  else if (fc == 0x04) {
+    uint16_t reg_addr = ((uint16_t)frame[2] << 8) | frame[3];
+    uint16_t reg_qty  = ((uint16_t)frame[4] << 8) | frame[5];
+
+    if (reg_addr != 0x0000 || reg_qty != 1) {
+      debug_printf("[MODBUS] FC04 illegal addr=0x%04X qty=%u\r\n", reg_addr, reg_qty);
+      SendModbusException(fc, 0x02); /* Illegal Data Address */
+      return;
+    }
+
+    uint16_t data = ReadModbusStatus();
+
+    uint8_t resp[7];
+    resp[0] = SLAVE_ID;
+    resp[1] = 0x04;
+    resp[2] = 0x02;
+    resp[3] = (data >> 8) & 0xFF;
+    resp[4] = data & 0xFF;
+    uint16_t resp_crc = Modbus_CRC16(resp, 5);
+    resp[5] = resp_crc & 0xFF;
+    resp[6] = (resp_crc >> 8) & 0xFF;
+    if (HAL_UART_Transmit(&huart4, resp, 7, 50) != HAL_OK) {
+      stat_tx_err++;
+      debug_printf("[MODBUS] TX ERR (FC04) total_tx_err=%lu\r\n", stat_tx_err);
+    } else {
+      debug_printf("[MODBUS] FC04 read 0x%04X ok (frame#%lu)\r\n", data, stat_frames);
+      debug_dump_hex("[TX]", resp, 7);
+    }
+  }
+  /* 5. 不支持的功能码：返回异常 0x01 Illegal Function */
+  else {
+    debug_printf("[MODBUS] Illegal FC=0x%02X (frame#%lu)\r\n", fc, stat_frames);
+    SendModbusException(fc, 0x01);
+  }
+}
+
 /* USER CODE END Application */
 
 /************************ (C) COPYRIGHT STMicroelectronics *****END OF FILE****/

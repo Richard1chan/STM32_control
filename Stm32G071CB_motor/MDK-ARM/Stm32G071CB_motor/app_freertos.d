@@ -48,3 +48,5 @@ stm32g071cb_motor\app_freertos.o: ../Middlewares/Third_Party/FreeRTOS/Source/CMS
 stm32g071cb_motor\app_freertos.o: ../Core/Inc/usart.h
 stm32g071cb_motor\app_freertos.o: ../Core/Inc/gpio.h
 stm32g071cb_motor\app_freertos.o: D:\Keil_v5\ARM\ARMCC\Bin\..\include\string.h
+stm32g071cb_motor\app_freertos.o: D:\Keil_v5\ARM\ARMCC\Bin\..\include\stdio.h
+stm32g071cb_motor\app_freertos.o: D:\Keil_v5\ARM\ARMCC\Bin\..\include\stdarg.h

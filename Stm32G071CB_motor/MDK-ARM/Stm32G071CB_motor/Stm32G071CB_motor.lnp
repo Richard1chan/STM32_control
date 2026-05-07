@@ -38,6 +38,6 @@
 "stm32g071cb_motor\heap_4.o"
 "stm32g071cb_motor\port.o"
 --library_type=microlib --strict --scatter "Stm32G071CB_motor\Stm32G071CB_motor.sct"
---summary_stderr --info summarysizes --map --xref --callgraph --symbols
+--summary_stderr --info summarysizes --map --load_addr_map_info --xref --callgraph --symbols
 --info sizes --info totals --info unused --info veneers
 --list "Stm32G071CB_motor.map" -o Stm32G071CB_motor\Stm32G071CB_motor.axf

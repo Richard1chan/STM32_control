@@ -23,6 +23,7 @@
 #include "stm32g0xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "usart.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -47,7 +48,7 @@
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN PFP */
-
+extern void Modbus_IdleCallback(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -186,7 +187,13 @@ void USART1_IRQHandler(void)
 void USART3_4_LPUART1_IRQHandler(void)
 {
   /* USER CODE BEGIN USART3_4_LPUART1_IRQn 0 */
-
+  /* 先于 HAL 处理 IDLE 标志：RX 线静默一个字符时间 → 帧结束信号 */
+  if (__HAL_UART_GET_FLAG(&huart4, UART_FLAG_IDLE) &&
+      __HAL_UART_GET_IT_SOURCE(&huart4, UART_IT_IDLE))
+  {
+    __HAL_UART_CLEAR_IDLEFLAG(&huart4);
+    Modbus_IdleCallback();
+  }
   /* USER CODE END USART3_4_LPUART1_IRQn 0 */
   HAL_UART_IRQHandler(&huart4);
   /* USER CODE BEGIN USART3_4_LPUART1_IRQn 1 */

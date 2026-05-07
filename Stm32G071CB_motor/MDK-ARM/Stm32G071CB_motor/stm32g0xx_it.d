@@ -35,3 +35,4 @@ stm32g071cb_motor\stm32g0xx_it.o: ../Drivers/STM32G0xx_HAL_Driver/Inc/stm32g0xx_
 stm32g071cb_motor\stm32g0xx_it.o: ../Drivers/STM32G0xx_HAL_Driver/Inc/stm32g0xx_hal_uart.h
 stm32g071cb_motor\stm32g0xx_it.o: ../Drivers/STM32G0xx_HAL_Driver/Inc/stm32g0xx_hal_uart_ex.h
 stm32g071cb_motor\stm32g0xx_it.o: ../Core/Inc/stm32g0xx_it.h
+stm32g071cb_motor\stm32g0xx_it.o: ../Core/Inc/usart.h
